@@ -7,7 +7,6 @@
 
 #![no_std]
 #![no_main]
-#![forbid(unsafe_code)]
 
 use core::fmt::Write;
 use core::str;

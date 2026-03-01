@@ -1,7 +1,7 @@
-pub mod cost;
 pub mod log;
 pub mod multi;
 pub mod noop;
+pub mod cost_observer;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
 pub mod prometheus;
@@ -13,8 +13,8 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
-pub use cost::CostObserver;
 pub use noop::NoopObserver;
+pub use cost_observer::CostObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
 pub use prometheus::PrometheusObserver;
@@ -22,52 +22,13 @@ pub use traits::{Observer, ObserverEvent};
 #[allow(unused_imports)]
 pub use verbose::VerboseObserver;
 
-use crate::config::schema::CostConfig;
 use crate::config::ObservabilityConfig;
-use crate::cost::CostTracker;
-use std::sync::Arc;
 
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
-    create_observer_internal(config)
-}
-
-/// Create an observer stack with optional cost tracking.
-///
-/// When cost tracking is enabled, wraps the base observer in a MultiObserver
-/// that also includes a CostObserver for recording token usage.
-pub fn create_observer_with_cost_tracking(
-    config: &ObservabilityConfig,
-    cost_tracker: Option<Arc<CostTracker>>,
-    cost_config: &CostConfig,
-) -> Box<dyn Observer> {
-    let base_observer = create_observer_internal(config);
-
-    match cost_tracker {
-        Some(tracker) if cost_config.enabled => {
-            let cost_observer = CostObserver::new(tracker, cost_config.prices.clone());
-            Box::new(MultiObserver::new(vec![
-                base_observer,
-                Box::new(cost_observer),
-            ]))
-        }
-        _ => base_observer,
-    }
-}
-
-fn create_observer_internal(config: &ObservabilityConfig) -> Box<dyn Observer> {
     match config.backend.as_str() {
         "log" => Box::new(LogObserver::new()),
-        "prometheus" => match PrometheusObserver::new() {
-            Ok(obs) => {
-                tracing::info!("Prometheus observer initialized");
-                Box::new(obs)
-            }
-            Err(e) => {
-                tracing::error!("Failed to create Prometheus observer: {e}. Falling back to noop.");
-                Box::new(NoopObserver)
-            }
-        },
+        "prometheus" => Box::new(PrometheusObserver::new()),
         "otel" | "opentelemetry" | "otlp" => {
             #[cfg(feature = "observability-otel")]
             match OtelObserver::new(

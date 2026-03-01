@@ -4,6 +4,7 @@ import {
   TrendingUp,
   Hash,
   Layers,
+  Wrench,
 } from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
@@ -43,6 +44,7 @@ export default function Cost() {
   }
 
   const models = Object.values(cost.by_model);
+  const tools = Object.values(cost.tool_calls_by_tool || {});
 
   return (
     <div className="p-6 space-y-6">
@@ -126,6 +128,114 @@ export default function Cost() {
             </p>
           </div>
         </div>
+      </div>
+
+      {/* Tool Usage */}
+      <div className="bg-gray-900 rounded-xl border border-gray-800 p-5">
+        <h3 className="text-base font-semibold text-white mb-4">
+          Tool Usage
+        </h3>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div className="bg-gray-800/50 rounded-lg p-4">
+            <p className="text-sm text-gray-400">Session Tool Calls</p>
+            <p className="text-xl font-bold text-white mt-1">
+              {cost.tool_calls_session.toLocaleString()}
+            </p>
+          </div>
+          <div className="bg-gray-800/50 rounded-lg p-4">
+            <p className="text-sm text-gray-400">Daily Tool Calls</p>
+            <p className="text-xl font-bold text-white mt-1">
+              {cost.tool_calls_daily.toLocaleString()}
+            </p>
+          </div>
+          <div className="bg-gray-800/50 rounded-lg p-4">
+            <p className="text-sm text-gray-400">Monthly Tool Calls</p>
+            <p className="text-xl font-bold text-white mt-1">
+              {cost.tool_calls_monthly.toLocaleString()}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* Tool Breakdown Table */}
+      <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
+        <div className="px-5 py-4 border-b border-gray-800 flex items-center gap-2">
+          <Wrench className="h-4 w-4 text-gray-400" />
+          <h3 className="text-base font-semibold text-white">
+            Tool Breakdown
+          </h3>
+        </div>
+        {tools.length === 0 ? (
+          <div className="p-8 text-center text-gray-500">
+            No tool usage available.
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-gray-800">
+                  <th className="text-left px-5 py-3 text-gray-400 font-medium">
+                    Tool
+                  </th>
+                  <th className="text-right px-5 py-3 text-gray-400 font-medium">
+                    Calls
+                  </th>
+                  <th className="text-right px-5 py-3 text-gray-400 font-medium">
+                    Success
+                  </th>
+                  <th className="text-right px-5 py-3 text-gray-400 font-medium">
+                    Failed
+                  </th>
+                  <th className="text-left px-5 py-3 text-gray-400 font-medium">
+                    Share
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {tools
+                  .sort((a, b) => b.request_count - a.request_count)
+                  .map((t) => {
+                    const share =
+                      cost.tool_calls_monthly > 0
+                        ? (t.request_count / cost.tool_calls_monthly) * 100
+                        : 0;
+                    return (
+                      <tr
+                        key={t.tool}
+                        className="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
+                      >
+                        <td className="px-5 py-3 text-white font-medium">
+                          {t.tool}
+                        </td>
+                        <td className="px-5 py-3 text-gray-300 text-right">
+                          {t.request_count.toLocaleString()}
+                        </td>
+                        <td className="px-5 py-3 text-gray-300 text-right">
+                          {t.success_count.toLocaleString()}
+                        </td>
+                        <td className="px-5 py-3 text-gray-300 text-right">
+                          {t.failure_count.toLocaleString()}
+                        </td>
+                        <td className="px-5 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="w-20 h-2 bg-gray-800 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-blue-500 rounded-full"
+                                style={{ width: `${Math.max(share, 2)}%` }}
+                              />
+                            </div>
+                            <span className="text-xs text-gray-400 w-10 text-right">
+                              {share.toFixed(1)}%
+                            </span>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Model Breakdown Table */}

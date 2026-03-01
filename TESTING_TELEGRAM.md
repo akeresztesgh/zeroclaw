@@ -297,7 +297,7 @@ on: [push, pull_request]
 
 jobs:
   test:
-    runs-on: [self-hosted, aws-india]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v3
       - uses: actions-rs/toolchain@v1

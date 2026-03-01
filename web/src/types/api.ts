@@ -49,34 +49,6 @@ export interface Integration {
   status: 'Available' | 'Active' | 'ComingSoon';
 }
 
-export interface IntegrationCredentialsField {
-  key: string;
-  label: string;
-  required: boolean;
-  has_value: boolean;
-  input_type: 'secret' | 'text' | 'select';
-  options: string[];
-  current_value?: string;
-  masked_value?: string;
-}
-
-export interface IntegrationSettingsEntry {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  status: Integration['status'];
-  configured: boolean;
-  activates_default_provider: boolean;
-  fields: IntegrationCredentialsField[];
-}
-
-export interface IntegrationSettingsPayload {
-  revision: string;
-  active_default_provider_integration_id?: string;
-  integrations: IntegrationSettingsEntry[];
-}
-
 export interface DiagResult {
   severity: 'ok' | 'warn' | 'error';
   category: string;
@@ -93,14 +65,6 @@ export interface MemoryEntry {
   score: number | null;
 }
 
-export interface PairedDevice {
-  id: string;
-  token_fingerprint: string;
-  created_at: string | null;
-  last_seen_at: string | null;
-  paired_by: string | null;
-}
-
 export interface CostSummary {
   session_cost_usd: number;
   daily_cost_usd: number;
@@ -108,6 +72,10 @@ export interface CostSummary {
   total_tokens: number;
   request_count: number;
   by_model: Record<string, ModelStats>;
+  tool_calls_session: number;
+  tool_calls_daily: number;
+  tool_calls_monthly: number;
+  tool_calls_by_tool: Record<string, ToolStats>;
 }
 
 export interface ModelStats {
@@ -115,6 +83,13 @@ export interface ModelStats {
   cost_usd: number;
   total_tokens: number;
   request_count: number;
+}
+
+export interface ToolStats {
+  tool: string;
+  request_count: number;
+  success_count: number;
+  failure_count: number;
 }
 
 export interface CliTool {
@@ -131,16 +106,11 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'history';
+  type: 'message' | 'chunk' | 'tool_call' | 'tool_result' | 'done' | 'error';
   content?: string;
   full_response?: string;
   name?: string;
   args?: any;
   output?: string;
   message?: string;
-  session_id?: string;
-  messages?: Array<{
-    role: 'user' | 'assistant';
-    content: string;
-  }>;
 }

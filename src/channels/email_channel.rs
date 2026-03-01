@@ -67,37 +67,10 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
-    /// Optional IMAP ID extension (RFC 2971) client identification.
+    /// Allowed forwarder addresses/domains for auto-forwarded mail
+    /// (empty = deny all, ["*"] = allow all)
     #[serde(default)]
-    pub imap_id: EmailImapIdConfig,
-}
-
-/// IMAP ID extension metadata (RFC 2971)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct EmailImapIdConfig {
-    /// Send IMAP `ID` command after login (recommended for some providers such as NetEase).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Client application name
-    #[serde(default = "default_imap_id_name")]
-    pub name: String,
-    /// Client application version
-    #[serde(default = "default_imap_id_version")]
-    pub version: String,
-    /// Client vendor name
-    #[serde(default = "default_imap_id_vendor")]
-    pub vendor: String,
-}
-
-impl Default for EmailImapIdConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_true(),
-            name: default_imap_id_name(),
-            version: default_imap_id_version(),
-            vendor: default_imap_id_vendor(),
-        }
-    }
+    pub allowed_forwarders: Vec<String>,
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -124,15 +97,6 @@ fn default_idle_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
-fn default_imap_id_name() -> String {
-    "zeroclaw".into()
-}
-fn default_imap_id_version() -> String {
-    env!("CARGO_PKG_VERSION").into()
-}
-fn default_imap_id_vendor() -> String {
-    "zeroclaw-labs".into()
-}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -148,7 +112,7 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
-            imap_id: EmailImapIdConfig::default(),
+            allowed_forwarders: Vec::new(),
         }
     }
 }
@@ -171,14 +135,36 @@ impl EmailChannel {
 
     /// Check if a sender email is in the allowlist
     pub fn is_sender_allowed(&self, email: &str) -> bool {
-        if self.config.allowed_senders.is_empty() {
+        Self::is_address_allowed(email, &self.config.allowed_senders)
+    }
+
+    /// Check if a forwarded address is in the forwarder allowlist
+    pub fn is_forwarder_allowed(&self, forwarded: &[String]) -> bool {
+        if self.config.allowed_forwarders.is_empty() {
             return false; // Empty = deny all
         }
-        if self.config.allowed_senders.iter().any(|a| a == "*") {
+        if self
+            .config
+            .allowed_forwarders
+            .iter()
+            .any(|a| a == "*")
+        {
             return true; // Wildcard = allow all
         }
+        forwarded.iter().any(|address| {
+            Self::is_address_allowed(address, &self.config.allowed_forwarders)
+        })
+    }
+
+    fn is_address_allowed(email: &str, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return false;
+        }
+        if allowed.iter().any(|a| a == "*") {
+            return true;
+        }
         let email_lower = email.to_lowercase();
-        self.config.allowed_senders.iter().any(|allowed| {
+        allowed.iter().any(|allowed| {
             if allowed.starts_with('@') {
                 // Domain match with @ prefix: "@example.com"
                 email_lower.ends_with(&allowed.to_lowercase())
@@ -246,6 +232,140 @@ impl EmailChannel {
         "(no readable content)".to_string()
     }
 
+    fn extract_forwarded_inline(body: &str) -> Option<(String, String, String)> {
+        let marker = "---------- Forwarded message ---------";
+        let idx = body.find(marker)?;
+        let after = &body[idx + marker.len()..];
+        let mut fwd_from = String::new();
+        let mut fwd_subject = String::new();
+        let mut fwd_date = String::new();
+        for line in after.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if fwd_from.is_empty() && line.to_lowercase().starts_with("from:") {
+                fwd_from = line[5..].trim().to_string();
+            } else if fwd_subject.is_empty() && line.to_lowercase().starts_with("subject:") {
+                fwd_subject = line[8..].trim().to_string();
+            } else if fwd_date.is_empty() && line.to_lowercase().starts_with("date:") {
+                fwd_date = line[5..].trim().to_string();
+            }
+            if !fwd_from.is_empty() && !fwd_subject.is_empty() && !fwd_date.is_empty() {
+                break;
+            }
+        }
+        if fwd_from.is_empty() && fwd_subject.is_empty() && fwd_date.is_empty() {
+            None
+        } else {
+            Some((fwd_from, fwd_subject, fwd_date))
+        }
+    }
+
+    fn extract_forwarded_attachment(parsed: &mail_parser::Message) -> Option<(String, String, String)> {
+        for part in parsed.attachments() {
+            let part: &mail_parser::MessagePart = part;
+            if let Some(ct) = MimeHeaders::content_type(part) {
+                if ct.ctype() == "message" && ct.subtype() == Some("rfc822") {
+                    let body = part.contents();
+                    if let Some(nested) = MessageParser::default().parse(body) {
+                        let from = nested
+                            .from()
+                            .and_then(|addr| addr.first())
+                            .and_then(|a| a.address())
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        let subject = nested.subject().unwrap_or("").to_string();
+                        let date = nested.date().map(|d| d.to_string()).unwrap_or_default();
+                        if !from.is_empty() || !subject.is_empty() || !date.is_empty() {
+                            return Some((from, subject, date));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn header_text_values(parsed: &mail_parser::Message, name: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        for value in parsed.header_values(name) {
+            if let Some(list) = value.as_text_list() {
+                for item in list {
+                    values.push(item.to_string());
+                }
+            } else if let Some(text) = value.as_text() {
+                values.push(text.to_string());
+            }
+        }
+        values
+    }
+
+    fn extract_emails(value: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for token in value.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+            let trimmed = token.trim_matches(|c: char| {
+                matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')
+            });
+            if trimmed.contains('@') && trimmed.contains('.') {
+                out.push(trimmed.to_string());
+            }
+        }
+        out
+    }
+
+    fn extract_forwarded_addresses(parsed: &mail_parser::Message) -> Vec<String> {
+        let mut values = Vec::new();
+        for header in ["X-Forwarded-To", "Delivered-To", "X-Forwarded-For", "Return-Path"] {
+            values.extend(Self::header_text_values(parsed, header));
+        }
+        let mut emails = Vec::new();
+        for value in values {
+            emails.extend(Self::extract_emails(&value));
+        }
+        emails
+    }
+
+    fn self_addresses(&self) -> Vec<String> {
+        let mut addrs = Vec::new();
+        addrs.extend(Self::extract_emails(&self.config.username));
+        addrs.extend(Self::extract_emails(&self.config.from_address));
+        if addrs.is_empty() {
+            if !self.config.username.trim().is_empty() {
+                addrs.push(self.config.username.trim().to_string());
+            }
+            if !self.config.from_address.trim().is_empty() {
+                addrs.push(self.config.from_address.trim().to_string());
+            }
+        }
+        addrs
+    }
+
+    fn is_self_address(&self, address: &str) -> bool {
+        let address_lower = address.trim().to_lowercase();
+        if address_lower.is_empty() {
+            return false;
+        }
+        self.self_addresses()
+            .iter()
+            .any(|a| a.trim().eq_ignore_ascii_case(&address_lower))
+    }
+
+    fn select_reply_target(&self, sender: &str, forwarded: &[String]) -> String {
+        for address in forwarded {
+            if self.is_self_address(address) {
+                continue;
+            }
+            if Self::is_address_allowed(address, &self.config.allowed_forwarders) {
+                return address.to_string();
+            }
+        }
+        if self.is_sender_allowed(sender) {
+            return sender.to_string();
+        }
+        sender.to_string()
+    }
+
     /// Connect to IMAP server with TLS and authenticate
     async fn connect_imap(&self) -> Result<ImapSession> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
@@ -269,52 +389,13 @@ impl EmailChannel {
         let client = async_imap::Client::new(stream);
 
         // Login
-        let mut session = client
+        let session = client
             .login(&self.config.username, &self.config.password)
             .await
             .map_err(|(e, _)| anyhow!("IMAP login failed: {}", e))?;
 
         debug!("IMAP login successful");
-        self.send_imap_id(&mut session).await;
         Ok(session)
-    }
-
-    /// Send RFC 2971 IMAP ID extension metadata.
-    /// Any ID errors are non-fatal to keep compatibility with providers
-    /// that do not support the extension.
-    async fn send_imap_id(&self, session: &mut ImapSession) {
-        if !self.config.imap_id.enabled {
-            debug!("IMAP ID extension disabled by configuration");
-            return;
-        }
-
-        let name = self.config.imap_id.name.trim();
-        let version = self.config.imap_id.version.trim();
-        let vendor = self.config.imap_id.vendor.trim();
-
-        let mut identification: Vec<(&str, Option<&str>)> = Vec::new();
-        if !name.is_empty() {
-            identification.push(("name", Some(name)));
-        }
-        if !version.is_empty() {
-            identification.push(("version", Some(version)));
-        }
-        if !vendor.is_empty() {
-            identification.push(("vendor", Some(vendor)));
-        }
-
-        if identification.is_empty() {
-            debug!("IMAP ID extension enabled but no identification fields configured");
-            return;
-        }
-
-        match session.id(identification).await {
-            Ok(_) => debug!("IMAP ID extension sent successfully"),
-            Err(err) => warn!(
-                "IMAP ID extension failed (continuing without ID metadata): {}",
-                err
-            ),
-        }
     }
 
     /// Fetch and process unseen messages from the selected mailbox
@@ -345,7 +426,35 @@ impl EmailChannel {
                     let sender = Self::extract_sender(&parsed);
                     let subject = parsed.subject().unwrap_or("(no subject)").to_string();
                     let body_text = Self::extract_text(&parsed);
-                    let content = format!("Subject: {}\n\n{}", subject, body_text);
+                    let forwarded_addresses = Self::extract_forwarded_addresses(&parsed);
+                    let forwarded_allowed = self.is_forwarder_allowed(&forwarded_addresses);
+                    let mut fwd_meta = Self::extract_forwarded_attachment(&parsed)
+                        .or_else(|| Self::extract_forwarded_inline(&body_text));
+                    if fwd_meta.is_none() && forwarded_allowed {
+                        let date = parsed.date().map(|d| d.to_string()).unwrap_or_default();
+                        fwd_meta = Some((sender.clone(), subject.clone(), date));
+                    }
+                    let mut content = format!("Subject: {}", subject);
+                    if let Some((f_from, f_subject, f_date)) = fwd_meta {
+                        content.push_str("\nForwarded: true");
+                        content.push_str(
+                            "\nForwarded-Note: This is a forwarded email. Summarize the message in 2–4 concise bullets (or a short paragraph if bullets don't fit). Do not act unless explicitly asked.",
+                        );
+                        content.push_str("\nForwarded-Summary:");
+                        if !f_from.is_empty() {
+                            content.push_str(&format!("\n- From: {}", f_from));
+                        }
+                        if !f_subject.is_empty() {
+                            content.push_str(&format!("\n- Subject: {}", f_subject));
+                        }
+                        if !f_date.is_empty() {
+                            content.push_str(&format!("\n- Date: {}", f_date));
+                        }
+                        if f_from.is_empty() && f_subject.is_empty() && f_date.is_empty() {
+                            content.push_str("\n- (forwarded metadata unavailable)");
+                        }
+                    }
+                    content.push_str(&format!("\n\n{}", body_text));
                     let msg_id = parsed
                         .message_id()
                         .map(|s| s.to_string())
@@ -381,6 +490,7 @@ impl EmailChannel {
                         msg_id,
                         sender,
                         content,
+                        forwarded_addresses,
                         timestamp: ts,
                     });
                 }
@@ -519,7 +629,9 @@ impl EmailChannel {
 
         for email in messages {
             // Check allowlist
-            if !self.is_sender_allowed(&email.sender) {
+            if !self.is_sender_allowed(&email.sender)
+                && !self.is_forwarder_allowed(&email.forwarded_addresses)
+            {
                 warn!("Blocked email from {}", email.sender);
                 continue;
             }
@@ -532,9 +644,10 @@ impl EmailChannel {
                 continue;
             }
 
+            let reply_target = self.select_reply_target(&email.sender, &email.forwarded_addresses);
             let msg = ChannelMessage {
                 id: email.msg_id,
-                reply_target: email.sender.clone(),
+                reply_target,
                 sender: email.sender,
                 content: email.content,
                 channel: "email".to_string(),
@@ -574,6 +687,7 @@ struct ParsedEmail {
     msg_id: String,
     sender: String,
     content: String,
+    forwarded_addresses: Vec<String>,
     timestamp: u64,
 }
 
@@ -699,10 +813,7 @@ mod tests {
         assert_eq!(config.from_address, "");
         assert_eq!(config.idle_timeout_secs, 1740);
         assert!(config.allowed_senders.is_empty());
-        assert!(config.imap_id.enabled);
-        assert_eq!(config.imap_id.name, "zeroclaw");
-        assert_eq!(config.imap_id.version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(config.imap_id.vendor, "zeroclaw-labs");
+        assert!(config.allowed_forwarders.is_empty());
     }
 
     #[test]
@@ -719,7 +830,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
-            imap_id: EmailImapIdConfig::default(),
+            allowed_forwarders: vec!["forwarder@example.com".to_string()],
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
@@ -740,7 +851,7 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
-            imap_id: EmailImapIdConfig::default(),
+            allowed_forwarders: vec!["forwarder.test".to_string()],
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
@@ -986,7 +1097,7 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
-            imap_id: EmailImapIdConfig::default(),
+            allowed_forwarders: vec!["forwarder@example.com".to_string()],
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -995,6 +1106,7 @@ mod tests {
         assert_eq!(deserialized.imap_host, config.imap_host);
         assert_eq!(deserialized.smtp_port, config.smtp_port);
         assert_eq!(deserialized.allowed_senders, config.allowed_senders);
+        assert_eq!(deserialized.allowed_forwarders, config.allowed_forwarders);
     }
 
     #[test]
@@ -1012,8 +1124,6 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
-        assert!(config.imap_id.enabled); // default
-        assert_eq!(config.imap_id.name, "zeroclaw"); // default
     }
 
     #[test]
@@ -1052,45 +1162,6 @@ mod tests {
         };
         let channel = EmailChannel::new(config);
         assert_eq!(channel.config.idle_timeout_secs, 600);
-    }
-
-    #[test]
-    fn imap_id_defaults_deserialize_when_omitted() {
-        let json = r#"{
-            "imap_host": "imap.test.com",
-            "smtp_host": "smtp.test.com",
-            "username": "user",
-            "password": "pass",
-            "from_address": "bot@test.com"
-        }"#;
-
-        let config: EmailConfig = serde_json::from_str(json).unwrap();
-        assert!(config.imap_id.enabled);
-        assert_eq!(config.imap_id.name, "zeroclaw");
-        assert_eq!(config.imap_id.vendor, "zeroclaw-labs");
-    }
-
-    #[test]
-    fn imap_id_custom_values_deserialize() {
-        let json = r#"{
-            "imap_host": "imap.test.com",
-            "smtp_host": "smtp.test.com",
-            "username": "user",
-            "password": "pass",
-            "from_address": "bot@test.com",
-            "imap_id": {
-                "enabled": false,
-                "name": "custom-client",
-                "version": "9.9.9",
-                "vendor": "custom-vendor"
-            }
-        }"#;
-
-        let config: EmailConfig = serde_json::from_str(json).unwrap();
-        assert!(!config.imap_id.enabled);
-        assert_eq!(config.imap_id.name, "custom-client");
-        assert_eq!(config.imap_id.version, "9.9.9");
-        assert_eq!(config.imap_id.vendor, "custom-vendor");
     }
 
     #[test]

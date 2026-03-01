@@ -11,40 +11,31 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-pub const ROLE_SYSTEM: &str = "system";
-pub const ROLE_USER: &str = "user";
-pub const ROLE_ASSISTANT: &str = "assistant";
-pub const ROLE_TOOL: &str = "tool";
-
-pub fn is_user_or_assistant_role(role: &str) -> bool {
-    role == ROLE_USER || role == ROLE_ASSISTANT
-}
-
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
-            role: ROLE_SYSTEM.into(),
+            role: "system".into(),
             content: content.into(),
         }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
-            role: ROLE_USER.into(),
+            role: "user".into(),
             content: content.into(),
         }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
-            role: ROLE_ASSISTANT.into(),
+            role: "assistant".into(),
             content: content.into(),
         }
     }
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
-            role: ROLE_TOOL.into(),
+            role: "tool".into(),
             content: content.into(),
         }
     }
@@ -79,9 +70,6 @@ pub struct ChatResponse {
     /// sent back in subsequent API requests — some providers reject tool-call
     /// history that omits this field.
     pub reasoning_content: Option<String>,
-    /// Quota metadata extracted from response headers (if available).
-    /// Populated by providers that support quota tracking.
-    pub quota_metadata: Option<super::quota_types::QuotaMetadata>,
 }
 
 impl ChatResponse {
@@ -375,7 +363,6 @@ pub trait Provider: Send + Sync {
                     tool_calls: Vec::new(),
                     usage: None,
                     reasoning_content: None,
-                    quota_metadata: None,
                 });
             }
         }
@@ -388,7 +375,6 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-            quota_metadata: None,
         })
     }
 
@@ -424,7 +410,6 @@ pub trait Provider: Send + Sync {
             tool_calls: Vec::new(),
             usage: None,
             reasoning_content: None,
-            quota_metadata: None,
         })
     }
 
@@ -450,25 +435,21 @@ pub trait Provider: Send + Sync {
     }
 
     /// Streaming chat with history.
-    /// Default implementation extracts the last user message and delegates to
-    /// `stream_chat_with_system`, mirroring the non-streaming `chat_with_history`.
+    /// Default implementation falls back to stream_chat_with_system with last user message.
     fn stream_chat_with_history(
         &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
+        _messages: &[ChatMessage],
+        _model: &str,
+        _temperature: f64,
+        _options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let system = messages
-            .iter()
-            .find(|m| m.role == "system")
-            .map(|m| m.content.as_str());
-        let last_user = messages
-            .iter()
-            .rfind(|m| m.role == "user")
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
-        self.stream_chat_with_system(system, last_user, model, temperature, options)
+        // For default implementation, we need to convert to owned strings
+        // This is a limitation of the default implementation
+        let provider_name = "unknown".to_string();
+
+        // Create a single empty chunk to indicate not supported
+        let chunk = StreamChunk::error(format!("{} does not support streaming", provider_name));
+        stream::once(async move { Ok(chunk) }).boxed()
     }
 }
 
@@ -554,7 +535,6 @@ mod tests {
             tool_calls: vec![],
             usage: None,
             reasoning_content: None,
-            quota_metadata: None,
         };
         assert!(!empty.has_tool_calls());
         assert_eq!(empty.text_or_empty(), "");
@@ -568,7 +548,6 @@ mod tests {
             }],
             usage: None,
             reasoning_content: None,
-            quota_metadata: None,
         };
         assert!(with_tools.has_tool_calls());
         assert_eq!(with_tools.text_or_empty(), "Let me check");
@@ -591,7 +570,6 @@ mod tests {
                 output_tokens: Some(50),
             }),
             reasoning_content: None,
-            quota_metadata: None,
         };
         assert_eq!(resp.usage.as_ref().unwrap().input_tokens, Some(100));
         assert_eq!(resp.usage.as_ref().unwrap().output_tokens, Some(50));

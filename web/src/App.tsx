@@ -7,7 +7,6 @@ import Tools from './pages/Tools';
 import Cron from './pages/Cron';
 import Integrations from './pages/Integrations';
 import Memory from './pages/Memory';
-import Devices from './pages/Devices';
 import Config from './pages/Config';
 import Cost from './pages/Cost';
 import Logs from './pages/Logs';
@@ -17,13 +16,13 @@ import { setLocale, type Locale } from './lib/i18n';
 
 // Locale context
 interface LocaleContextType {
-  locale: Locale;
-  setAppLocale: (locale: Locale) => void;
+  locale: string;
+  setAppLocale: (locale: string) => void;
 }
 
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'tr',
-  setAppLocale: (_locale: Locale) => {},
+  setAppLocale: () => {},
 });
 
 export const useLocaleContext = () => useContext(LocaleContext);
@@ -82,11 +81,11 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState<Locale>('tr');
+  const [locale, setLocaleState] = useState('tr');
 
-  const setAppLocale = (newLocale: Locale) => {
+  const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
-    setLocale(newLocale);
+    setLocale(newLocale as Locale);
   };
 
   // Listen for 401 events to force logout
@@ -120,7 +119,6 @@ function AppContent() {
           <Route path="/cron" element={<Cron />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/memory" element={<Memory />} />
-          <Route path="/devices" element={<Devices />} />
           <Route path="/config" element={<Config />} />
           <Route path="/cost" element={<Cost />} />
           <Route path="/logs" element={<Logs />} />

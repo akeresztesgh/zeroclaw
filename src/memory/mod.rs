@@ -1,9 +1,7 @@
 pub mod backend;
 pub mod chunker;
 pub mod cli;
-pub mod cortex;
 pub mod embeddings;
-pub mod hybrid;
 pub mod hygiene;
 pub mod lucid;
 pub mod markdown;
@@ -22,8 +20,6 @@ pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
     selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
 };
-pub use cortex::CortexMemMemory;
-pub use hybrid::SqliteQdrantHybridMemory;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
@@ -53,16 +49,10 @@ where
     G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
-        MemoryBackendKind::Sqlite | MemoryBackendKind::SqliteQdrantHybrid => {
-            Ok(Box::new(sqlite_builder()?))
-        }
+        MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
-        }
-        MemoryBackendKind::CortexMem => {
-            let local = sqlite_builder()?;
-            Ok(Box::new(CortexMemMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
@@ -220,10 +210,7 @@ pub fn create_memory_with_storage_and_routes(
         && config.snapshot_on_hygiene
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite
-                | MemoryBackendKind::SqliteQdrantHybrid
-                | MemoryBackendKind::Lucid
-                | MemoryBackendKind::CortexMem
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
     {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
@@ -236,10 +223,7 @@ pub fn create_memory_with_storage_and_routes(
     if config.auto_hydrate
         && matches!(
             backend_kind,
-            MemoryBackendKind::Sqlite
-                | MemoryBackendKind::SqliteQdrantHybrid
-                | MemoryBackendKind::Lucid
-                | MemoryBackendKind::CortexMem
+            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
         )
         && snapshot::should_hydrate(workspace_dir)
     {
@@ -270,14 +254,13 @@ pub fn create_memory_with_storage_and_routes(
             ));
 
         #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_options(
+        let mem = SqliteMemory::with_embedder(
             workspace_dir,
             embedder,
             config.vector_weight as f32,
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
-            &config.sqlite_journal_mode,
         )?;
         Ok(mem)
     }
@@ -302,7 +285,6 @@ pub fn create_memory_with_storage_and_routes(
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
-            storage_provider.tls,
         )?;
         Ok(Box::new(memory))
     }
@@ -316,10 +298,7 @@ pub fn create_memory_with_storage_and_routes(
         );
     }
 
-    fn build_qdrant_memory(
-        config: &MemoryConfig,
-        resolved_embedding: &ResolvedEmbeddingConfig,
-    ) -> anyhow::Result<QdrantMemory> {
+    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         let url = config
             .qdrant
             .url
@@ -352,26 +331,12 @@ pub fn create_memory_with_storage_and_routes(
             url,
             collection
         );
-        Ok(QdrantMemory::new_lazy(
+        return Ok(Box::new(QdrantMemory::new_lazy(
             &url,
             &collection,
             qdrant_api_key,
             embedder,
-        ))
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Qdrant) {
-        return Ok(Box::new(build_qdrant_memory(config, &resolved_embedding)?));
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::SqliteQdrantHybrid) {
-        let sqlite: Arc<dyn Memory> = Arc::new(build_sqlite_memory(
-            config,
-            workspace_dir,
-            &resolved_embedding,
-        )?);
-        let qdrant: Arc<dyn Memory> = Arc::new(build_qdrant_memory(config, &resolved_embedding)?);
-        return Ok(Box::new(SqliteQdrantHybridMemory::new(sqlite, qdrant)));
+        )));
     }
 
     create_memory_with_builders(
@@ -389,7 +354,7 @@ pub fn create_memory_for_migration(
 ) -> anyhow::Result<Box<dyn Memory>> {
     if matches!(classify_memory_backend(backend), MemoryBackendKind::None) {
         anyhow::bail!(
-            "memory backend 'none' disables persistence; choose sqlite, lucid, cortex-mem, or markdown before migration"
+            "memory backend 'none' disables persistence; choose sqlite, lucid, or markdown before migration"
         );
     }
 
@@ -486,32 +451,6 @@ mod tests {
     }
 
     #[test]
-    fn factory_cortex_mem() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "cortex-mem".into(),
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "cortex-mem");
-    }
-
-    #[test]
-    fn factory_sqlite_qdrant_hybrid() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "sqlite_qdrant_hybrid".into(),
-            qdrant: crate::config::QdrantConfig {
-                url: Some("http://localhost:6333".into()),
-                ..crate::config::QdrantConfig::default()
-            },
-            ..MemoryConfig::default()
-        };
-        let mem = create_memory(&cfg, tmp.path(), None).unwrap();
-        assert_eq!(mem.name(), "sqlite_qdrant_hybrid");
-    }
-
-    #[test]
     fn factory_none_uses_noop_memory() {
         let tmp = TempDir::new().unwrap();
         let cfg = MemoryConfig {
@@ -538,13 +477,6 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = create_memory_for_migration("lucid", tmp.path()).unwrap();
         assert_eq!(mem.name(), "lucid");
-    }
-
-    #[test]
-    fn migration_factory_cortex_mem() {
-        let tmp = TempDir::new().unwrap();
-        let mem = create_memory_for_migration("cortex-mem", tmp.path()).unwrap();
-        assert_eq!(mem.name(), "cortex-mem");
     }
 
     #[test]
@@ -591,26 +523,6 @@ mod tests {
         } else {
             assert!(error.to_string().contains("memory-postgres"));
         }
-    }
-
-    #[test]
-    fn factory_hybrid_requires_qdrant_url() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "sqlite_qdrant_hybrid".into(),
-            qdrant: crate::config::QdrantConfig {
-                url: None,
-                ..crate::config::QdrantConfig::default()
-            },
-            ..MemoryConfig::default()
-        };
-
-        let error = create_memory(&cfg, tmp.path(), None)
-            .err()
-            .expect("hybrid backend should require qdrant url");
-        assert!(error
-            .to_string()
-            .contains("Qdrant memory backend requires url"));
     }
 
     #[test]

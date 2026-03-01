@@ -1,7 +1,9 @@
+use super::parse_cost_timezone;
 use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
 use crate::config::schema::CostConfig;
 use anyhow::{anyhow, Context, Result};
 use chrono::{Datelike, NaiveDate, Utc};
+use chrono_tz::Tz;
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -22,7 +24,8 @@ impl CostTracker {
     pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
         let storage_path = resolve_storage_path(workspace_dir)?;
 
-        let storage = CostStorage::new(&storage_path).with_context(|| {
+        let tz = parse_cost_timezone(&config.timezone);
+        let storage = CostStorage::new(&storage_path, tz).with_context(|| {
             format!("Failed to open cost storage at {}", storage_path.display())
         })?;
 
@@ -135,9 +138,11 @@ impl CostTracker {
 
     /// Get the current cost summary.
     pub fn get_summary(&self) -> Result<CostSummary> {
-        let (daily_cost, monthly_cost) = {
+        let (daily_cost, monthly_cost, monthly_tokens, monthly_requests, monthly_by_model) = {
             let mut storage = self.lock_storage();
-            storage.get_aggregated_costs()?
+            let (daily, monthly) = storage.get_aggregated_costs()?;
+            let (tokens, requests, by_model) = storage.get_monthly_usage()?;
+            (daily, monthly, tokens, requests, by_model)
         };
 
         let session_costs = self.lock_session_costs();
@@ -145,20 +150,18 @@ impl CostTracker {
             .iter()
             .map(|record| record.usage.cost_usd)
             .sum();
-        let total_tokens: u64 = session_costs
-            .iter()
-            .map(|record| record.usage.total_tokens)
-            .sum();
-        let request_count = session_costs.len();
-        let by_model = build_session_model_stats(&session_costs);
 
         Ok(CostSummary {
             session_cost_usd: session_cost,
             daily_cost_usd: daily_cost,
             monthly_cost_usd: monthly_cost,
-            total_tokens,
-            request_count,
-            by_model,
+            total_tokens: monthly_tokens,
+            request_count: monthly_requests,
+            by_model: monthly_by_model,
+            tool_calls_session: 0,
+            tool_calls_daily: 0,
+            tool_calls_monthly: 0,
+            tool_calls_by_tool: HashMap::new(),
         })
     }
 
@@ -230,27 +233,40 @@ struct CostStorage {
     path: PathBuf,
     daily_cost_usd: f64,
     monthly_cost_usd: f64,
+    monthly_tokens: u64,
+    monthly_requests: usize,
+    monthly_by_model: HashMap<String, ModelStats>,
     cached_day: NaiveDate,
     cached_year: i32,
     cached_month: u32,
+    last_len: u64,
+    last_modified: Option<std::time::SystemTime>,
+    tz: Tz,
 }
 
 impl CostStorage {
     /// Create or open cost storage.
-    fn new(path: &Path) -> Result<Self> {
+    fn new(path: &Path, tz: Tz) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
 
-        let now = Utc::now();
+        let now = Utc::now().with_timezone(&tz);
+        let (last_len, last_modified) = file_state(path);
         let mut storage = Self {
             path: path.to_path_buf(),
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
+            monthly_tokens: 0,
+            monthly_requests: 0,
+            monthly_by_model: HashMap::new(),
             cached_day: now.date_naive(),
             cached_year: now.year(),
             cached_month: now.month(),
+            last_len,
+            last_modified,
+            tz,
         };
 
         storage.rebuild_aggregates(
@@ -306,21 +322,39 @@ impl CostStorage {
     fn rebuild_aggregates(&mut self, day: NaiveDate, year: i32, month: u32) -> Result<()> {
         let mut daily_cost = 0.0;
         let mut monthly_cost = 0.0;
+        let mut monthly_tokens: u64 = 0;
+        let mut monthly_requests: usize = 0;
+        let mut monthly_by_model: HashMap<String, ModelStats> = HashMap::new();
 
         self.for_each_record(|record| {
-            let timestamp = record.usage.timestamp.naive_utc();
-
-            if timestamp.date() == day {
+            let timestamp = record.usage.timestamp.with_timezone(&self.tz);
+            if timestamp.date_naive() == day {
                 daily_cost += record.usage.cost_usd;
             }
 
             if timestamp.year() == year && timestamp.month() == month {
                 monthly_cost += record.usage.cost_usd;
+                monthly_tokens = monthly_tokens.saturating_add(record.usage.total_tokens);
+                monthly_requests = monthly_requests.saturating_add(1);
+                let entry = monthly_by_model
+                    .entry(record.usage.model.clone())
+                    .or_insert_with(|| ModelStats {
+                        model: record.usage.model.clone(),
+                        cost_usd: 0.0,
+                        total_tokens: 0,
+                        request_count: 0,
+                    });
+                entry.cost_usd += record.usage.cost_usd;
+                entry.total_tokens = entry.total_tokens.saturating_add(record.usage.total_tokens);
+                entry.request_count = entry.request_count.saturating_add(1);
             }
         })?;
 
         self.daily_cost_usd = daily_cost;
         self.monthly_cost_usd = monthly_cost;
+        self.monthly_tokens = monthly_tokens;
+        self.monthly_requests = monthly_requests;
+        self.monthly_by_model = monthly_by_model;
         self.cached_day = day;
         self.cached_year = year;
         self.cached_month = month;
@@ -329,12 +363,19 @@ impl CostStorage {
     }
 
     fn ensure_period_cache_current(&mut self) -> Result<()> {
-        let now = Utc::now();
+        let now = Utc::now().with_timezone(&self.tz);
         let day = now.date_naive();
         let year = now.year();
         let month = now.month();
-
-        if day != self.cached_day || year != self.cached_year || month != self.cached_month {
+        let (len, modified) = file_state(&self.path);
+        let file_changed = len != self.last_len || modified != self.last_modified;
+        if day != self.cached_day
+            || year != self.cached_year
+            || month != self.cached_month
+            || file_changed
+        {
+            self.last_len = len;
+            self.last_modified = modified;
             self.rebuild_aggregates(day, year, month)?;
         }
 
@@ -356,8 +397,8 @@ impl CostStorage {
 
         self.ensure_period_cache_current()?;
 
-        let timestamp = record.usage.timestamp.naive_utc();
-        if timestamp.date() == self.cached_day {
+        let timestamp = record.usage.timestamp.with_timezone(&self.tz);
+        if timestamp.date_naive() == self.cached_day {
             self.daily_cost_usd += record.usage.cost_usd;
         }
         if timestamp.year() == self.cached_year && timestamp.month() == self.cached_month {
@@ -371,6 +412,15 @@ impl CostStorage {
     fn get_aggregated_costs(&mut self) -> Result<(f64, f64)> {
         self.ensure_period_cache_current()?;
         Ok((self.daily_cost_usd, self.monthly_cost_usd))
+    }
+
+    fn get_monthly_usage(&mut self) -> Result<(u64, usize, HashMap<String, ModelStats>)> {
+        self.ensure_period_cache_current()?;
+        Ok((
+            self.monthly_tokens,
+            self.monthly_requests,
+            self.monthly_by_model.clone(),
+        ))
     }
 
     /// Get cost for a specific date.
@@ -400,6 +450,14 @@ impl CostStorage {
         Ok(cost)
     }
 }
+
+fn file_state(path: &Path) -> (u64, Option<std::time::SystemTime>) {
+    match fs::metadata(path) {
+        Ok(meta) => (meta.len(), meta.modified().ok()),
+        Err(_) => (0, None),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

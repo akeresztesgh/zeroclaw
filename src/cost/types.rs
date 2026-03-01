@@ -124,6 +124,14 @@ pub struct CostSummary {
     pub request_count: usize,
     /// Breakdown by model
     pub by_model: std::collections::HashMap<String, ModelStats>,
+    /// Total tool calls for the session
+    pub tool_calls_session: usize,
+    /// Total tool calls for the day
+    pub tool_calls_daily: usize,
+    /// Total tool calls for the month
+    pub tool_calls_monthly: usize,
+    /// Breakdown of tool calls by tool name
+    pub tool_calls_by_tool: std::collections::HashMap<String, ToolStats>,
 }
 
 /// Statistics for a specific model.
@@ -139,6 +147,19 @@ pub struct ModelStats {
     pub request_count: usize,
 }
 
+/// Statistics for a specific tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolStats {
+    /// Tool name
+    pub tool: String,
+    /// Total calls
+    pub request_count: usize,
+    /// Successful calls
+    pub success_count: usize,
+    /// Failed calls
+    pub failure_count: usize,
+}
+
 impl Default for CostSummary {
     fn default() -> Self {
         Self {
@@ -148,6 +169,10 @@ impl Default for CostSummary {
             total_tokens: 0,
             request_count: 0,
             by_model: std::collections::HashMap::new(),
+            tool_calls_session: 0,
+            tool_calls_daily: 0,
+            tool_calls_monthly: 0,
+            tool_calls_by_tool: std::collections::HashMap::new(),
         }
     }
 }
