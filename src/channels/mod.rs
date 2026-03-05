@@ -86,6 +86,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
+use tokio::process::Command as TokioCommand;
 use tokio_util::sync::CancellationToken;
 
 /// Per-sender conversation history for channel messages.
@@ -118,6 +119,8 @@ const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
 const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+const RESEARCH_TO_TRELLO_SCRIPT: &str =
+    "/home/aj/.zeroclaw/workspace/skills/research-to-trello/scripts/research_to_trello.py";
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Guardrail for hook-modified outbound channel content.
@@ -1075,6 +1078,129 @@ async fn handle_runtime_command_if_needed(
     true
 }
 
+fn is_research_to_trello_trigger(channel: &str, content: &str) -> bool {
+    channel.eq_ignore_ascii_case("telegram")
+        && content
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("research this:")
+}
+
+async fn handle_research_to_trello_if_needed(
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_research_to_trello_trigger(&msg.channel, &msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let output = TokioCommand::new("python3")
+        .arg(RESEARCH_TO_TRELLO_SCRIPT)
+        .arg("--query")
+        .arg(msg.content.clone())
+        .arg("--limit")
+        .arg("5")
+        .arg("--board")
+        .arg("Todo")
+        .arg("--list")
+        .arg("TODO")
+        .arg("--source-channel")
+        .arg("telegram")
+        .arg("--source-sender")
+        .arg(msg.sender.clone())
+        .arg("--trigger")
+        .arg("research this")
+        .output()
+        .await;
+
+    let response = match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let parsed = serde_json::from_str::<serde_json::Value>(&stdout).ok();
+            let card_url = parsed
+                .as_ref()
+                .and_then(|v| v.get("card_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let transcript_status = parsed
+                .as_ref()
+                .and_then(|v| v.get("transcript_status_line"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Transcript: unknown");
+            let bullets = parsed
+                .as_ref()
+                .and_then(|v| v.get("top_bullets"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .take(3)
+                        .map(|s| format!("- {s}"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let counts = parsed
+                .as_ref()
+                .and_then(|v| v.get("counts"))
+                .and_then(|v| v.as_object());
+
+            let x = counts
+                .and_then(|c| c.get("x"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let yt = counts
+                .and_then(|c| c.get("youtube"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            let web = counts
+                .and_then(|c| c.get("google"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            let mut lines = Vec::new();
+            if card_url.is_empty() {
+                lines.push("Research brief created in Trello.".to_string());
+            } else {
+                lines.push(format!("Research brief created: {card_url}"));
+            }
+            lines.extend(bullets);
+            lines.push(format!("Source counts: X={x}, YouTube={yt}, Google={web}"));
+            lines.push(transcript_status.to_string());
+            lines.join("\n")
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let detail = if !stderr.trim().is_empty() {
+                stderr.trim()
+            } else {
+                stdout.trim()
+            };
+            format!(
+                "I couldn't complete the research-to-Trello workflow.\n{}",
+                truncate_with_ellipsis(detail, 500)
+            )
+        }
+        Err(err) => format!("I couldn't start the research workflow: {err}"),
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!(
+            "Failed to send research-to-trello response on {}: {err}",
+            channel.name()
+        );
+    }
+
+    true
+}
+
 async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
@@ -1555,6 +1681,9 @@ async fn process_channel_message(
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_research_to_trello_if_needed(&msg, target_channel.as_ref()).await {
         return;
     }
 
@@ -3495,6 +3624,20 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    #[test]
+    fn research_to_trello_trigger_matches_telegram_prefix_only() {
+        assert!(is_research_to_trello_trigger(
+            "telegram",
+            "research this: https://example.com"
+        ));
+        assert!(is_research_to_trello_trigger(
+            "telegram",
+            "   ReSeArCh ThIs: topic"
+        ));
+        assert!(!is_research_to_trello_trigger("discord", "research this: topic"));
+        assert!(!is_research_to_trello_trigger("telegram", "please research this topic"));
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
